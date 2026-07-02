@@ -6,7 +6,6 @@
 <meta name="description" content="نظام إدارة مكتبة الكنيسة - إدارة احترافية للكتب والاستعارة والمستعيرين">
 <title>مكتبة كنيسة مارجرجس بدسوق - نظام الإدارة</title>
 
-   
 <!-- Google Fonts - Cairo -->
 <link href="https://fonts.googleapis.com/css2?family=Cairo:wght@300;400;500;600;700;800;900&display=swap" rel="stylesheet">
 <!-- Font Awesome -->
@@ -1615,7 +1614,116 @@ const Store = {
     }
   },
 
+  /* ============================================================
+     AUTO-REFRESH: polling every 30s to sync all connected devices
+  ============================================================ */
+  _autoRefreshInterval: null,
+  _countdownInterval: null,
+  _isSaving: false,
+
+  startAutoRefresh(intervalMs = 30000) {
+    if (this._autoRefreshInterval) return; // already running
+    const intervalSec = Math.round(intervalMs / 1000);
+    let remaining = intervalSec;
+    let syncOk = true; // tracks whether last poll succeeded
+
+    // ── Countdown: ticks every second ──────────────────────────
+    const updateCountdown = () => {
+      if (this._isSaving) return;
+      const txt = document.getElementById('sync-status-text');
+      const icon = document.getElementById('sync-status-icon');
+      if (!txt) return;
+
+      if (!syncOk) return; // leave error message alone
+
+      txt.textContent = `متصل بالسحاب 🟢 | ${remaining}ث`;
+      if (icon && !icon.className.includes('spin')) icon.className = 'fas fa-cloud';
+
+      remaining = remaining > 0 ? remaining - 1 : intervalSec;
+    };
+    updateCountdown(); // show immediately on start
+    this._countdownInterval = setInterval(updateCountdown, 1000);
+
+    // ── Main polling interval ──────────────────────────────────
+    this._autoRefreshInterval = setInterval(async () => {
+      if (this._isSaving) return;
+
+      // Show "جاري التحديث..." briefly
+      const txt  = document.getElementById('sync-status-text');
+      const icon = document.getElementById('sync-status-icon');
+      if (txt)  txt.textContent = 'جاري التحديث...';
+      if (icon) icon.className  = 'fas fa-sync fa-spin';
+
+      try {
+        const prevBookCount   = this.books.length;
+        const prevLoanCount   = this.loans.length;
+        const prevBorrowers   = this.borrowers.length;
+
+        const data = await API.getAll();
+        const newBooks     = data.books     || [];
+        const newLoans     = data.loans     || [];
+        const newBorrowers = data.borrowers || [];
+
+        const changed =
+          newBooks.length     !== prevBookCount  ||
+          newLoans.length     !== prevLoanCount  ||
+          newBorrowers.length !== prevBorrowers  ||
+          JSON.stringify(newBooks)     !== JSON.stringify(this.books)     ||
+          JSON.stringify(newLoans)     !== JSON.stringify(this.loans)     ||
+          JSON.stringify(newBorrowers) !== JSON.stringify(this.borrowers);
+
+        if (changed) {
+          this.books     = newBooks;
+          this.loans     = newLoans;
+          this.borrowers = newBorrowers;
+          if (data.categories && data.categories.length) this.categories = data.categories;
+          if (data.settings && typeof Settings !== 'undefined') {
+            Settings._current = { ...Settings._current, ...data.settings };
+          }
+          this.rebuildCategoryMaps();
+          this.updateLoanStatuses(false);
+
+          const activePage = document.querySelector('.page.active');
+          if (activePage) {
+            const pageId = activePage.id.replace('page-', '');
+            if (pageId === 'dashboard'  && typeof Dashboard !== 'undefined')  Dashboard.render();
+            if (pageId === 'books'      && typeof Books      !== 'undefined')  Books.render();
+            if (pageId === 'loans'      && typeof Loans      !== 'undefined')  Loans.render();
+            if (pageId === 'borrowers'  && typeof Borrowers  !== 'undefined')  Borrowers.render();
+            if (pageId === 'borrow'     && typeof Borrow     !== 'undefined')  Borrow.render();
+          }
+          if (typeof Dashboard !== 'undefined') Dashboard.render();
+          Toast.show('🔄 تم تحديث البيانات من جهاز آخر', 'info', 3000);
+        }
+
+        // ✅ Always mark success and reset countdown
+        syncOk    = true;
+        remaining = intervalSec;
+        if (icon) icon.className = 'fas fa-cloud';
+        if (txt)  txt.textContent = `متصل بالسحاب 🟢 | ${remaining}ث`;
+
+      } catch (e) {
+        console.warn('Auto-refresh failed:', e);
+        syncOk = false;
+        UI.updateSyncStatus('error', 'غير متصل 🔴');
+      }
+    }, intervalMs);
+    console.log(`✅ Auto-refresh started (every ${intervalSec}s)`);
+  },
+
+  stopAutoRefresh() {
+    if (this._autoRefreshInterval) {
+      clearInterval(this._autoRefreshInterval);
+      this._autoRefreshInterval = null;
+    }
+    if (this._countdownInterval) {
+      clearInterval(this._countdownInterval);
+      this._countdownInterval = null;
+    }
+  },
+
   async save() {
+    this._isSaving = true;
     Loader.show('جاري حفظ البيانات في Google Sheets...');
     UI.updateSyncStatus('loading', 'جاري الحفظ...');
     try {
@@ -1628,12 +1736,14 @@ const Store = {
       });
       Loader.hide();
       UI.updateSyncStatus('success', 'متصل بالسحاب 🟢');
+      this._isSaving = false;
       return true;
     } catch (e) {
       Loader.hide();
       console.error(e);
       UI.updateSyncStatus('error', 'غير متصل 🔴');
       Toast.error('خطأ أثناء حفظ التعديلات: ' + e.message);
+      this._isSaving = false;
       return false;
     }
   },
@@ -3824,6 +3934,9 @@ document.addEventListener('DOMContentLoaded', async () => {
   Loader.show('جاري تحميل البيانات من Google Sheets...');
   try {
     await UI.init();
+
+    // Start auto-refresh so all connected devices stay in sync
+    Store.startAutoRefresh(30000); // every 30 seconds
 
     const lastSearch = Storage.get('clib_last_books_search', '');
     if (lastSearch) {
